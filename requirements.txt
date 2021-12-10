@@ -1,0 +1,8 @@
+paho-mqtt
+pycluon
+av
+numpy
+fastapi
+environs
+uvicorn
+aiortc
