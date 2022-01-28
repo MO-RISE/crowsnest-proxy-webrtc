@@ -1,58 +1,53 @@
-import argparse
 import asyncio
+import atexit
 import json
 import logging
-import platform
+import warnings
+import ssl
 
-from fastapi import a
+from environs import Env
+
+from asyncio_mqtt import Client, MqttError
+
+from paho.mqtt.client import MQTTv5, MQTTMessage
+from paho.mqtt.packettypes import PacketTypes
+from paho.mqtt.properties import Properties
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer, MediaRelay
 
-ROOT = os.path.dirname(__file__)
+env = Env()
+
+MQTT_BROKER_HOST = env("MQTT_BROKER_HOST")
+MQTT_BROKER_PORT = env.int("MQTT_BROKER_PORT", 1883)
+MQTT_CLIENT_ID = env("MQTT_CLIENT_ID", None)
+MQTT_TRANSPORT = env("MQTT_TRANSPORT", "tcp")
+MQTT_TLS = env.bool("MQTT_TLS", False)
+MQTT_USER = env("MQTT_USER", None)
+MQTT_PASSWORD = env("MQTT_PASSWORD", None)
+MQTT_BASE_TOPIC = env("MQTT_BASE_TOPIC", "/test/test")
+
+MEDIA_SOURCE = env("MEDIA_SOURCE")
+TARGET_BITRATE = env.int("TARGET_BITRATE", None)
+
+LOG_LEVEL = env.log_level("LOG_LEVEL", logging.WARNING)
+
+# Setup logger
+logging.basicConfig(level=LOG_LEVEL)
+logging.captureWarnings(True)
+warnings.filterwarnings("once")
+LOGGER = logging.getLogger("crowsnest-webrtc-producer")
+
+# mq = Client(client_id=MQTT_CLIENT_ID, transport=MQTT_TRANSPORT, protocol=MQTTv5)
+
+# Globals...
+pcs = set()
+source = None
 
 
-relay = None
-webcam = None
-
-
-def create_local_tracks(play_from):
-    global relay, webcam
-
-    if play_from:
-        player = MediaPlayer(play_from)
-        return player.audio, player.video
-    else:
-        options = {"framerate": "30", "video_size": "640x480"}
-        if relay is None:
-            if platform.system() == "Darwin":
-                webcam = MediaPlayer(
-                    "default:none", format="avfoundation", options=options
-                )
-            elif platform.system() == "Windows":
-                webcam = MediaPlayer(
-                    "video=Integrated Camera", format="dshow", options=options
-                )
-            else:
-                webcam = MediaPlayer("/dev/video0", format="v4l2", options=options)
-            relay = MediaRelay()
-        return None, relay.subscribe(webcam.video)
-
-
-async def index(request):
-    content = open(os.path.join(ROOT, "index.html"), "r").read()
-    return web.Response(content_type="text/html", text=content)
-
-
-async def javascript(request):
-    content = open(os.path.join(ROOT, "client.js"), "r").read()
-    return web.Response(content_type="application/javascript", text=content)
-
-
-async def offer(request):
-    params = await request.json()
-    print(params)
-    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+async def offer(sdp: str, type: str):
+    logging.info("Do we get here?")
+    offer = RTCSessionDescription(sdp=sdp, type=type)
 
     pc = RTCPeerConnection()
     pcs.add(pc)
@@ -64,65 +59,81 @@ async def offer(request):
             await pc.close()
             pcs.discard(pc)
 
-    # open media source
-    audio, video = create_local_tracks(args.play_from)
-
     await pc.setRemoteDescription(offer)
     for t in pc.getTransceivers():
-        if t.kind == "audio" and audio:
-            pc.addTrack(audio)
-        elif t.kind == "video" and video:
-            pc.addTrack(video)
+        if t.kind == "audio" and source.audio:
+            pc.addTrack(MediaRelay().subscribe(source.audio))
+        elif t.kind == "video" and source.video:
+            pc.addTrack(MediaRelay().subscribe(source.video))
 
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
 
-    return web.Response(
-        content_type="application/json",
-        text=json.dumps(
-            {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
-        ),
-    )
+    return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
 
 
-pcs = set()
-
-
-async def on_shutdown(app):
+async def clean_up():
     # close peer connections
     coros = [pc.close() for pc in pcs]
-    await asyncio.gather(*coros)
+    asyncio.gather(*coros)
     pcs.clear()
 
 
+async def main():
+
+    client = Client(
+        MQTT_BROKER_HOST,
+        MQTT_BROKER_PORT,
+        username=MQTT_USER,
+        password=MQTT_PASSWORD,
+        protocol=MQTTv5,
+        transport=MQTT_TRANSPORT,
+    )
+
+    client._client.tls_set()
+    await client.connect()
+
+    async with client.unfiltered_messages() as messages:
+        await client.subscribe(f"{MQTT_BASE_TOPIC}/offer")
+
+        message: MQTTMessage
+        async for message in messages:
+            logging.info("Received request for a new peer connection")
+
+            payload = json.loads(message.payload)
+            response_topic = message.properties.ResponseTopic
+            correlation_data = message.properties.CorrelationData
+
+            answer = await offer(payload["sdp"], payload["type"])
+
+            properties = Properties(PacketTypes.PUBLISH)
+            properties.CorrelationData = correlation_data
+
+            await client.publish(
+                response_topic, json.dumps(answer), properties=properties
+            )
+
+    await client.disconnect()
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="WebRTC webcam demo")
-    parser.add_argument("--cert-file", help="SSL certificate file (for HTTPS)")
-    parser.add_argument("--key-file", help="SSL key file (for HTTPS)")
-    parser.add_argument("--play-from", help="Read the media from a file and sent it."),
-    parser.add_argument(
-        "--host", default="0.0.0.0", help="Host for HTTP server (default: 0.0.0.0)"
-    )
-    parser.add_argument(
-        "--port", type=int, default=8080, help="Port for HTTP server (default: 8080)"
-    )
-    parser.add_argument("--verbose", "-v", action="count")
-    args = parser.parse_args()
 
-    if args.verbose:
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.INFO)
+    if TARGET_BITRATE:
+        # Workaround for setting a target bitrate for the video feed, see: https://github.com/aiortc/aiortc/issues/402
+        import aiortc
 
-    if args.cert_file:
-        ssl_context = ssl.SSLContext()
-        ssl_context.load_cert_chain(args.cert_file, args.key_file)
-    else:
-        ssl_context = None
+        aiortc.codecs.vpx.MIN_BITRATE = (
+            aiortc.codecs.vpx.DEFAULT_BITRATE
+        ) = aiortc.codecs.vpx.MAX_BITRATE = TARGET_BITRATE
 
-    app = web.Application()
-    app.on_shutdown.append(on_shutdown)
-    app.router.add_get("/", index)
-    app.router.add_get("/client.js", javascript)
-    app.router.add_post("/offer", offer)
-    web.run_app(app, host=args.host, port=args.port, ssl_context=ssl_context)
+    # Open media source
+    source = MediaPlayer(MEDIA_SOURCE)
+
+    loop = asyncio.get_event_loop()
+
+    try:
+        loop.run_until_complete(main())
+    except MqttError as exc:
+        print(exc)
+    finally:
+        loop.run_until_complete(clean_up())
