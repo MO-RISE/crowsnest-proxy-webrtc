@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import warnings
+from weakref import WeakValueDictionary
 
 from environs import Env
 
@@ -38,11 +39,11 @@ warnings.filterwarnings("once")
 LOGGER = logging.getLogger("crowsnest-webrtc-producer")
 
 # Globals
-sources = {}
+sources = WeakValueDictionary()
 pcs = set()
 
 
-async def offer(sdp: str, sdp_type: str, source: MediaPlayer):
+async def create_peer_connection(sdp: str, sdp_type: str, source: MediaPlayer):
     """Negotiating WebRTC connection
 
     Args:
@@ -56,8 +57,16 @@ async def offer(sdp: str, sdp_type: str, source: MediaPlayer):
     remote_description = RTCSessionDescription(sdp=sdp, type=sdp_type)
 
     pc = RTCPeerConnection()  # pylint: disable=invalid-name
+
+    await pc.setRemoteDescription(remote_description)
+
+    # Add to global
     pcs.add(pc)
 
+    # Attach strong reference to source
+    pc.source = source
+
+    # Attach callback
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
         LOGGER.info("Connection state is %s", pc.connectionState)
@@ -65,7 +74,6 @@ async def offer(sdp: str, sdp_type: str, source: MediaPlayer):
             await pc.close()
             pcs.discard(pc)
 
-    await pc.setRemoteDescription(remote_description)
     for transceiver in pc.getTransceivers():
         if transceiver.kind == "audio" and source.audio:
             pc.addTrack(MediaRelay().subscribe(source.audio))
@@ -128,10 +136,13 @@ async def main():
             properties = Properties(PacketTypes.PUBLISH)
             properties.CorrelationData = correlation_data
 
-            # Try to create source if it does not already exist!
-            if path not in sources:
+            # Try to get an existing source
+            source = sources.get(path)
+
+            # If fail, create a new one
+            if source is None:
                 try:
-                    sources[path] = MediaPlayer(f"{MEDIA_SOURCE}{path}")
+                    source = sources[path] = MediaPlayer(f"{MEDIA_SOURCE}{path}")
                 except Exception as exc:  # pylint: disable=broad-except
                     await client.publish(
                         response_topic,
@@ -141,8 +152,9 @@ async def main():
                     return
 
             # We have a working source, lets get the connection set up
-            source = sources[path]
-            answer = await offer(payload["sdp"], payload["type"], source)
+            answer = await create_peer_connection(
+                payload["sdp"], payload["type"], source
+            )
 
             await client.publish(
                 response_topic, json.dumps(answer), properties=properties
