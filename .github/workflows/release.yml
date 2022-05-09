@@ -29,8 +29,8 @@ jobs:
           file: Dockerfile
           push: true
           tags: |
-            ghcr.io/mo-rise/crowsnest-auth:latest
-            ghcr.io/mo-rise/crowsnest-auth:${{ github.event.release.tag_name }}
+            ghcr.io/mo-rise/crowsnest-proxy-webrtc:latest
+            ghcr.io/mo-rise/crowsnest-proxy-webrtc:${{ github.event.release.tag_name }}
       -
         name: Image digest
         run: echo ${{ steps.docker_build.outputs.digest }}
