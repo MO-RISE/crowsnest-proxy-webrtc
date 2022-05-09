@@ -29,6 +29,8 @@
   <button id="start" onclick="start()">Start</button>
   <button id="stop" style="display: none" onclick="stop()">Stop</button>
 
+  <input type="text" id="path" name="path">
+
   <div id="media">
     <h2>Media</h2>
 
@@ -81,15 +83,17 @@
           type: offer.type,
         });
 
+        var requestTopic = document.getElementById('path').value;
+
         var responseTopic = "muppet" + Math.random();
 
         client.on("message", function (topic, message) {
-          pc.setRemoteDescription(JSON.parse(message.toString()));
           client.unsubscribe(responseTopic);
+          pc.setRemoteDescription(JSON.parse(message.toString()));
         })
         client.subscribe(responseTopic);
 
-        client.publish("/test/test/offer", payload, {
+        client.publish(requestTopic, payload, {
           properties: {
             responseTopic: responseTopic,
             correlationData: text2Binary("hej"),

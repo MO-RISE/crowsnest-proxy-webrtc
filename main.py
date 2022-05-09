@@ -1,9 +1,8 @@
+"""Main entrypoint for this application"""
 import asyncio
-import atexit
 import json
 import logging
 import warnings
-import ssl
 
 from environs import Env
 
@@ -25,7 +24,7 @@ MQTT_TRANSPORT = env("MQTT_TRANSPORT", "tcp")
 MQTT_TLS = env.bool("MQTT_TLS", False)
 MQTT_USER = env("MQTT_USER", None)
 MQTT_PASSWORD = env("MQTT_PASSWORD", None)
-MQTT_BASE_TOPIC = env("MQTT_BASE_TOPIC", "/test/test")
+MQTT_BASE_TOPIC = env("MQTT_BASE_TOPIC")
 
 MEDIA_SOURCE = env("MEDIA_SOURCE")
 TARGET_BITRATE = env.int("TARGET_BITRATE", None)
@@ -38,32 +37,39 @@ logging.captureWarnings(True)
 warnings.filterwarnings("once")
 LOGGER = logging.getLogger("crowsnest-webrtc-producer")
 
-# mq = Client(client_id=MQTT_CLIENT_ID, transport=MQTT_TRANSPORT, protocol=MQTTv5)
-
-# Globals...
+# Globals
+sources = {}
 pcs = set()
-source = None
 
 
-async def offer(sdp: str, type: str):
-    logging.info("Do we get here?")
-    offer = RTCSessionDescription(sdp=sdp, type=type)
+async def offer(sdp: str, sdp_type: str, source: MediaPlayer):
+    """Negotiating WebRTC connection
 
-    pc = RTCPeerConnection()
+    Args:
+        sdp (str): Session Description Protocol string
+        type (str): Type of sdp, i.e. offer or answer
+        source (MediaPlayer): the source to be used for the connection
+
+    Returns:
+        str: Session Description Protocol (SDP) answer
+    """
+    remote_description = RTCSessionDescription(sdp=sdp, type=sdp_type)
+
+    pc = RTCPeerConnection()  # pylint: disable=invalid-name
     pcs.add(pc)
 
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
-        print("Connection state is %s" % pc.connectionState)
+        LOGGER.info("Connection state is %s", pc.connectionState)
         if pc.connectionState == "failed":
             await pc.close()
             pcs.discard(pc)
 
-    await pc.setRemoteDescription(offer)
-    for t in pc.getTransceivers():
-        if t.kind == "audio" and source.audio:
+    await pc.setRemoteDescription(remote_description)
+    for transceiver in pc.getTransceivers():
+        if transceiver.kind == "audio" and source.audio:
             pc.addTrack(MediaRelay().subscribe(source.audio))
-        elif t.kind == "video" and source.video:
+        elif transceiver.kind == "video" and source.video:
             pc.addTrack(MediaRelay().subscribe(source.video))
 
     answer = await pc.createAnswer()
@@ -73,13 +79,14 @@ async def offer(sdp: str, type: str):
 
 
 async def clean_up():
-    # close peer connections
+    """Clean up by closing all open peer connections"""
     coros = [pc.close() for pc in pcs]
     asyncio.gather(*coros)
     pcs.clear()
 
 
 async def main():
+    """Main "loop" """
 
     client = Client(
         MQTT_BROKER_HOST,
@@ -90,24 +97,52 @@ async def main():
         transport=MQTT_TRANSPORT,
     )
 
-    client._client.tls_set()
+    if MQTT_TLS:
+        client._client.tls_set()  # pylint: disable=protected-access
+
     await client.connect()
 
     async with client.unfiltered_messages() as messages:
-        await client.subscribe(f"{MQTT_BASE_TOPIC}/offer")
+        await client.subscribe(f"{MQTT_BASE_TOPIC}/#")
 
         message: MQTTMessage
         async for message in messages:
-            logging.info("Received request for a new peer connection")
 
+            topic: str = message.topic
+            path: str = topic.replace(MQTT_BASE_TOPIC, "", 1)
+
+            logging.info(
+                "Received request for a new peer connection on topic: %s, i.e. path: %s",
+                topic,
+                path,
+            )
+
+            # Get the payload, i.e. SDP
             payload = json.loads(message.payload)
+
+            # Extract MQTTv5 messaging protocol specifics
             response_topic = message.properties.ResponseTopic
             correlation_data = message.properties.CorrelationData
 
-            answer = await offer(payload["sdp"], payload["type"])
-
+            # Create return properties struct
             properties = Properties(PacketTypes.PUBLISH)
             properties.CorrelationData = correlation_data
+
+            # Try to create source if it does not already exist!
+            if path not in sources:
+                try:
+                    sources[path] = MediaPlayer(f"{MEDIA_SOURCE}{path}")
+                except Exception as exc:  # pylint: disable=broad-except
+                    await client.publish(
+                        response_topic,
+                        json.dumps(str(exc)),
+                        properties=properties,
+                    )
+                    return
+
+            # We have a working source, lets get the connection set up
+            source = sources[path]
+            answer = await offer(payload["sdp"], payload["type"], source)
 
             await client.publish(
                 response_topic, json.dumps(answer), properties=properties
@@ -119,21 +154,21 @@ async def main():
 if __name__ == "__main__":
 
     if TARGET_BITRATE:
-        # Workaround for setting a target bitrate for the video feed, see: https://github.com/aiortc/aiortc/issues/402
+        # Workaround for setting a target bitrate for the video feed,
+        # see: https://github.com/aiortc/aiortc/issues/402
         import aiortc
 
         aiortc.codecs.vpx.MIN_BITRATE = (
             aiortc.codecs.vpx.DEFAULT_BITRATE
         ) = aiortc.codecs.vpx.MAX_BITRATE = TARGET_BITRATE
 
-    # Open media source
-    source = MediaPlayer(MEDIA_SOURCE)
-
     loop = asyncio.get_event_loop()
 
     try:
         loop.run_until_complete(main())
-    except MqttError as exc:
-        print(exc)
+    except MqttError:
+        LOGGER.exception(
+            "MQTT connection failed, automatic reconnect has not yet been fixed..."
+        )
     finally:
         loop.run_until_complete(clean_up())
